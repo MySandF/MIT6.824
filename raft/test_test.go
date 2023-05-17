@@ -195,6 +195,7 @@ func TestFailNoAgree2B(t *testing.T) {
 	cfg.disconnect((leader + 1) % servers)
 	cfg.disconnect((leader + 2) % servers)
 	cfg.disconnect((leader + 3) % servers)
+	fmt.Println("server disconnected...")
 
 	index, _, ok := cfg.rafts[leader].Start(20)
 	if ok != true {
@@ -205,16 +206,17 @@ func TestFailNoAgree2B(t *testing.T) {
 	}
 
 	time.Sleep(2 * RaftElectionTimeout)
-
+	fmt.Println("wake up, check nCommitted")
 	n, _ := cfg.nCommitted(index)
 	if n > 0 {
 		t.Fatalf("%v committed but no majority", n)
 	}
-
+	fmt.Println("check complete, try to reconnect server")
 	// repair
 	cfg.connect((leader + 1) % servers)
 	cfg.connect((leader + 2) % servers)
 	cfg.connect((leader + 3) % servers)
+	fmt.Println("server reconnected...")
 
 	// the disconnected majority may have chosen a leader from
 	// among their own ranks, forgetting index 2.

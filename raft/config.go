@@ -177,6 +177,7 @@ func (cfg *config) start1(i int) {
 				// ignore other types of ApplyMsg
 			} else {
 				v := m.Command
+				// fmt.Println("receive Apply: ", m)
 				cfg.mu.Lock()
 				for j := 0; j < len(cfg.logs); j++ {
 					if old, oldok := cfg.logs[j][m.CommandIndex]; oldok && old != v {
@@ -187,6 +188,7 @@ func (cfg *config) start1(i int) {
 				}
 				_, prevok := cfg.logs[i][m.CommandIndex-1]
 				cfg.logs[i][m.CommandIndex] = v
+				// DPrintf("cfg.logs[%d][%d] = %d", i, m.CommandIndex, v)
 				if m.CommandIndex > cfg.maxIndex {
 					cfg.maxIndex = m.CommandIndex
 				}
@@ -376,6 +378,8 @@ func (cfg *config) nCommitted(index int) (int, interface{}) {
 		cmd1, ok := cfg.logs[i][index]
 		cfg.mu.Unlock()
 		if ok {
+			// val := cmd1.(int)
+			// DPrintf("nCommited: [%d] cmd = ", val)
 			if count > 0 && cmd != cmd1 {
 				cfg.t.Fatalf("committed values do not match: index %v, %v, %v\n",
 					index, cmd, cmd1)
