@@ -8,5 +8,10 @@
 - 处理事件时首先判断raft是否被kill
 - 可以PASS测试，但依然存在BUG：两个election timeout在同一50ms内会出问题，会同时收到另一server的投票  
 已解决：Raft.votefor变量需要加锁
-## lab2B
-- follower能正确接收entry，但是测试不通过，猜测是interface的问题
+## lab2B 5/14~
+- follower能正确接收entry，但是测试不通过  
+解决：  
+   1. 没有向applyCh发送ApplyMsg  
+   2. 且leader没有发送
+- 5/16: 重写RequestVote逻辑，通过前三小节
+- 5/17: 完善AppendEntries，通过前五小节

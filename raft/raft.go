@@ -95,6 +95,7 @@ type Raft struct {
 	heartbeatTerm      int
 	muTimer            sync.Mutex
 
+	entryChan chan int
 	//apply channel
 	applyCh chan ApplyMsg
 }
@@ -184,54 +185,57 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	term := rf.currentTerm
 	state := rf.currentState
+	rf.mu.Unlock()
 	DPrintf("[%d] requestVote to [%d](%d)", args.CandidateId, rf.me, state)
-	// 判断up to date
-	isUpToDate := false
-	lastIndex := len(rf.log)
-	lastTerm := 0
-	if lastIndex != 0 {
-		lastTerm = rf.log[lastIndex-1].Term
-	}
-	DPrintf("[%d]() lastTerm:%d, lastIndex:%d, candidate[%d] lastTerm:%d, lastIndex:%d", rf.me, lastTerm, lastIndex, args.CandidateId, args.LastLogTerm, args.LastLogIndex)
-	if lastTerm > args.LastLogTerm {
-		isUpToDate = false
-	} else if lastTerm == args.LastLogTerm {
-		if lastIndex > args.LastLogIndex {
-			isUpToDate = false
-		} else {
-			isUpToDate = true
-		}
-	} else {
-		isUpToDate = true
-	}
-	// 判断是否投票
 	if term > args.Term { // 当前server任期大, 拒绝投票
 		DPrintf("[%d](%d) > [%d](%d)", rf.me, term, args.CandidateId, args.Term)
 		reply.Term = term
 		reply.VoteGranted = false
 	} else {
-		if term < args.Term { // 当前server任期小, 转FOLLOWER, 投票
+		// 判断up to date
+		isUpToDate := false
+		lastIndex := len(rf.log)
+		lastTerm := 0
+		if lastIndex != 0 {
+			lastTerm = rf.log[lastIndex-1].Term
+		}
+		DPrintf("[%d]() lastTerm:%d, lastIndex:%d, candidate[%d] lastTerm:%d, lastIndex:%d", rf.me, lastTerm, lastIndex, args.CandidateId, args.LastLogTerm, args.LastLogIndex)
+		if lastTerm > args.LastLogTerm {
+			isUpToDate = false
+		} else if lastTerm == args.LastLogTerm {
+			if lastIndex > args.LastLogIndex {
+				isUpToDate = false
+			} else {
+				isUpToDate = true
+			}
+		} else {
+			isUpToDate = true
+		}
+		if term < args.Term { // 当前server任期小, 转FOLLOWER
 			DPrintf("[%d]'s term %d < candidate[%d]'s term %d", rf.me, term, args.CandidateId, args.Term)
 			reply.Term = args.Term
+			rf.mu.Lock()
 			rf.currentTerm = args.Term
 			rf.votefor = -1
 			if state != FOLLOWER {
 				rf.currentState = FOLLOWER
 				DPrintf("[%d] in RequestVote(): turn to follower", rf.me)
 			}
+			rf.mu.Unlock()
 		} else {
 			reply.Term = term
 		}
 		DPrintf("[%d] older than candidate[%d] ? %t", rf.me, args.CandidateId, isUpToDate)
-		DPrintf("[%d] Votefor = %d", rf.me, rf.votefor)
+		rf.mu.Lock()
 		if (rf.votefor == -1 || rf.votefor == args.CandidateId) && isUpToDate {
 			rf.votefor = args.CandidateId
 			reply.VoteGranted = true
 		} else {
 			reply.VoteGranted = false
 		}
-		rf.resetElectionTimer()
+		DPrintf("[%d] Votefor = %d", rf.me, rf.votefor)
 		rf.mu.Unlock()
+		rf.resetElectionTimer()
 	}
 }
 
@@ -253,6 +257,7 @@ func (rf *Raft) startElection() {
 	} else {
 		lastLogTerm = rf.log[lastLogIndex-1].Term
 	}
+	rf.mu.Unlock()
 	DPrintf("[%d] start election, term: %d", me, term)
 	args := RequestVoteArgs{
 		Term:         term,
@@ -260,7 +265,6 @@ func (rf *Raft) startElection() {
 		LastLogIndex: lastLogIndex,
 		LastLogTerm:  lastLogTerm,
 	}
-	rf.mu.Unlock()
 	rf.resetElectionTimer()
 	for i := 0; i < len(rf.peers); i++ {
 		if i == me {
@@ -273,34 +277,36 @@ func (rf *Raft) startElection() {
 				DPrintf("[%d] sendRequestVote to [%d] failed", rf.me, i)
 				return
 			}
-			rf.mu.Lock()
 			if reply.VoteGranted {
+				rf.mu.Lock()
 				vote_count++
 				DPrintf("[%d] get vote from [%d], current vote: %d", rf.me, i, vote_count)
 				// this server win the election
 				if vote_count > len(rf.peers)/2 && rf.currentState != LEADER {
 					rf.currentState = LEADER
+					go rf.sendHeartBeat(term)
 					rf.heartbeatTerm = term
 					DPrintf("[%d] become leader", me)
 					rf.resetHeartbeatTimer()
+					go rf.heartbeatTimer()
 					// init nextIndex and matchIndex
 					for i := 0; i < len(rf.peers); i++ {
 						rf.nextIndex[i] = len(rf.log) + 1
 						rf.matchIndex[i] = 0
 					}
-					go rf.sendHeartBeat(term)
-					go rf.heartbeatTimer()
 				}
+				rf.mu.Unlock()
 			} else if reply.Term > term {
+				rf.mu.Lock()
 				rf.currentState = FOLLOWER
-				DPrintf("[%d] turn to follower", rf.me)
+				DPrintf("[%d] in startElection(): turn to follower", rf.me)
 				rf.currentTerm = reply.Term
 				rf.votefor = -1
+				rf.mu.Unlock()
 			}
 			if !reply.VoteGranted {
 				DPrintf("[%d] refuse vote for [%d]", i, rf.me)
 			}
-			rf.mu.Unlock()
 		}(i)
 	}
 }
@@ -327,7 +333,12 @@ func (rf *Raft) AppendEntries(args *AppendEntryArgs, reply *AppendEntryReply) {
 	defer rf.mu.Unlock()
 	state := rf.currentState
 	term := rf.currentTerm
-	index := len(rf.log) // maybe no Lock is fine
+	lastIndex := len(rf.log) // maybe no Lock is fine
+	// lastTerm := 0
+	// if lastIndex != 0 {
+	// 	lastTerm = rf.log[lastIndex-1].Term
+	// }
+	// rf.mu.Unlock()
 	reply.Term = term
 	// if term > leader's term, refuse
 	if term > args.Term {
@@ -337,38 +348,58 @@ func (rf *Raft) AppendEntries(args *AppendEntryArgs, reply *AppendEntryReply) {
 		return
 	}
 	// DPrintf("[%d] received entries from [%d]", rf.me, args.LeaderId)
+	// DPrintf("[%d] state(%d) term(%d) received heartbeat from [%d] term(%d)", rf.me, state, term, args.LeaderId, args.Term)
+	// rf.mu.Lock()
+	if term < args.Term {
+		rf.votefor = args.LeaderId
+		rf.currentTerm = args.Term
+	}
+	if state != FOLLOWER {
+		rf.currentState = FOLLOWER
+		DPrintf("[%d] turn to follower", rf.me)
+	}
+	// rf.mu.Unlock()
+	rf.resetElectionTimer()
+	// reply.Term = args.Term
 	if args.Entries == nil { // heartbeat
-		// DPrintf("[%d] state(%d) term(%d) received heartbeat from [%d] term(%d)", rf.me, state, term, args.LeaderId, args.Term)
-		if rf.currentTerm < args.Term {
-			rf.votefor = -1
-			rf.currentTerm = args.Term
-		}
-		if state != FOLLOWER {
-			rf.currentState = FOLLOWER
-			DPrintf("[%d] turn to follower", rf.me)
-		}
-		rf.resetElectionTimer()
-		reply.Term = args.Term
 		reply.Success = true
 	} else {
 		// append entries
-		// if index and term not found, refuse
-		if term == args.Term && index < args.PrevLogIndex {
+		// (1) return false if log doesn't contain and entry at prevLogIndex
+		// whose term matches prevLogTerm
+		// (2) if an existing entry conflicts with a new one(same index but
+		// different terms), delete the existing entry and all that following it
+		DPrintf("Append process: [%d]'s lastIndex: %d, [%d]'s prevLogIndex: %d,log = %d, entry = %d", rf.me, lastIndex, args.LeaderId, args.PrevLogIndex, rf.log, args.Entries)
+		if lastIndex < args.PrevLogIndex {
 			DPrintf("[%d]'s index < [%d]'s PrevLogIndex", rf.me, args.LeaderId)
 			reply.Success = false
 			return
-		} else if index == args.PrevLogIndex && term != args.Term {
-			DPrintf("[%d]'s term != [%d]'s Term, delete following entries", rf.me, args.LeaderId)
-			rf.log = rf.log[:index]
+		}
+		shouldAppend := true
+		if lastIndex > args.PrevLogIndex {
+			matchTerm := rf.log[args.PrevLogIndex].Term
+			if matchTerm != args.Term {
+				len1 := len(rf.log)
+				rf.log = rf.log[:args.PrevLogIndex-1]
+				len2 := len(rf.log)
+				DPrintf("[%d]'s term != [%d]'s Term, delete following entries, len: %d -> %d", rf.me, args.LeaderId, len1, len2)
+			}
+		}
+		if len(rf.log) > args.PrevLogIndex && rf.log[args.PrevLogIndex].Term == args.Term {
+			DPrintf("[%d]: entry already appended", rf.me)
+			shouldAppend = false
 		}
 		reply.Success = true
-		rf.log = append(rf.log, args.Entries...)
-		DPrintf("[%d] append entry from [%d], current len of log: %d, last command: %d", rf.me, args.LeaderId, len(rf.log), args.Entries[len(args.Entries)-1].Command)
-		// reply.Term = term
+		if shouldAppend {
+			applen1 := len(rf.log)
+			rf.log = append(rf.log, args.Entries...)
+			applen2 := len(rf.log)
+			DPrintf("[%d] append entry from [%d], len of log: %d -> %d, entry: %d", rf.me, args.LeaderId, applen1, applen2, rf.log)
+		}
 	}
 	if args.LeaderCommit > rf.commitIndex {
 		DPrintf("[%d] update commit,  commitIndex = %d, leaderCommit = %d", rf.me, rf.commitIndex, args.LeaderCommit)
-		lastNewEntry := index + len(args.Entries)
+		lastNewEntry := lastIndex + len(args.Entries)
 		if args.LeaderCommit < lastNewEntry {
 			rf.commitIndex = args.LeaderCommit
 		} else {
@@ -404,6 +435,7 @@ func (rf *Raft) sendHeartBeat(term int) {
 	}
 	leaderCommit := rf.commitIndex
 	isLeader := rf.currentState
+	rf.mu.Unlock()
 	if isLeader != LEADER {
 		return
 	}
@@ -415,7 +447,6 @@ func (rf *Raft) sendHeartBeat(term int) {
 		Entries:      nil,
 		LeaderCommit: leaderCommit,
 	}
-	rf.mu.Unlock()
 	// DPrintf("[%d] send heartbeat", rf.me)
 	for i := 0; i < len(rf.peers); i++ {
 		if i == rf.me {
@@ -430,106 +461,118 @@ func (rf *Raft) sendHeartBeat(term int) {
 				return
 			}
 			rf.mu.Lock()
+			term = rf.currentTerm
 			if reply.Term > term {
 				rf.currentState = FOLLOWER
 				rf.currentTerm = reply.Term
 				rf.votefor = -1
-				DPrintf("[%d] sendHeartBeat(): is not the latest term, term(%d -> %d), turn to follower", rf.me, term, rf.currentTerm)
+				DPrintf("[%d] in sendHeartBeat(): is not the latest term, term(%d -> %d), turn to follower", rf.me, term, reply.Term)
 			}
 			rf.mu.Unlock()
 		}(i)
 	}
 }
 
-func (rf *Raft) sendEntries(entries []Entry, waitAppendChan chan bool) {
-	if rf.killed() {
-		return
-	}
-	rf.mu.Lock()
-	term := rf.currentTerm
-	leaderId := rf.me
-	prevLogIndex := len(rf.log) - len(entries)
-	var prevLogTerm int
-	if prevLogIndex == 0 {
-		prevLogTerm = rf.currentTerm
-	} else {
-		prevLogTerm = rf.log[prevLogIndex-1].Term
-	}
-	leaderCommit := rf.commitIndex
-	appendCount := 1
-	var appendCountMtx sync.Mutex
-	rf.mu.Unlock()
-	for i := 0; i < len(rf.peers); i++ {
-		if i == leaderId {
+func (rf *Raft) sendEntries() {
+	for {
+		if rf.killed() {
+			return
+		}
+		var sendIndex int
+		hasEntry := false
+		select {
+		case sendIndex = <-rf.entryChan:
+			hasEntry = true
+		default:
+		}
+		if !hasEntry {
 			continue
 		}
-		go func(i int) {
-			args := AppendEntryArgs{
-				Term:         term,
-				LeaderId:     leaderId,
-				PrevLogIndex: prevLogIndex,
-				PrevLogTerm:  prevLogTerm,
-				Entries:      entries,
-				LeaderCommit: leaderCommit,
+		rf.mu.Lock()
+		entries := []Entry{rf.log[sendIndex-1]}
+		term := rf.currentTerm
+		leaderId := rf.me
+		prevLogIndex := sendIndex - 1
+		var prevLogTerm int
+		if prevLogIndex == 0 {
+			prevLogTerm = rf.currentTerm
+		} else {
+			prevLogTerm = rf.log[prevLogIndex-1].Term
+		}
+		leaderCommit := rf.commitIndex
+		DPrintf("[%d] sendEntries: entry = %d, log = %d, send index = %d", rf.me, entries, rf.log, sendIndex)
+		rf.mu.Unlock()
+		appendCount := 1
+		var appendCountMtx sync.Mutex
+		for i := 0; i < len(rf.peers); i++ {
+			if i == leaderId {
+				continue
 			}
-			for {
-				reply := AppendEntryReply{}
-				ok := rf.peers[i].Call("Raft.AppendEntries", &args, &reply)
-				for !ok {
-					// DPrintf("[%d] sendEntries to [%d] failed through RPC, retry...", leaderId, i)
-					if rf.killed() {
-						return
-					}
-					ok = rf.peers[i].Call("Raft.AppendEntries", &args, &reply)
-					time.Sleep(10 * time.Millisecond)
+			go func(i int) {
+				args := AppendEntryArgs{
+					Term:         term,
+					LeaderId:     leaderId,
+					PrevLogIndex: prevLogIndex,
+					PrevLogTerm:  prevLogTerm,
+					Entries:      entries,
+					LeaderCommit: leaderCommit,
 				}
-				rf.mu.Lock()
-				defer rf.mu.Unlock()
-				term = rf.currentTerm
-				if reply.Term > term {
-					rf.currentState = FOLLOWER
-					rf.currentTerm = reply.Term
-					rf.votefor = -1
-					DPrintf("[%d] in sendEntries() is not the latest term, term(%d -> %d), turn to follower", rf.me, term, reply.Term)
-					break
-				} else if !reply.Success {
-					DPrintf("[%d] send entries to [%d] failed", rf.me, i)
-					rf.nextIndex[i]--
-					args.PrevLogIndex--
-					args.Term = rf.currentTerm
-					args.PrevLogTerm = rf.log[args.PrevLogIndex-1].Term
-					args.Entries = append([]Entry{rf.log[args.PrevLogIndex]}, args.Entries...)
-				} else { // append success
-					appendCountMtx.Lock()
-					appendCount++
-					if appendCount > len(rf.peers)/2 {
-						rf.commitIndex = prevLogIndex + 1
-						// apply to state machine
-						for rf.commitIndex > rf.lastApplied {
-							// DPrintf("[%d] apply to state machine, lastApplied = %d, commitIndex = %d", rf.me, rf.lastApplied, rf.commitIndex)
-							// DPrintf("DEBUG: [%d] len of log = %d, lastApplied = %d", rf.me, len(rf.log), rf.lastApplied)
-							apply := ApplyMsg{
-								CommandValid: true,
-								Command:      rf.log[rf.lastApplied].Command,
-								CommandIndex: rf.lastApplied + 1,
-							}
-							rf.applyCh <- apply
-							DPrintf("[%d] Apply commitIndex: %d, lastApplied: %d, command: %d", rf.me, rf.commitIndex, rf.lastApplied, rf.log[rf.lastApplied].Command)
-							rf.lastApplied++
+				for {
+					DPrintf("[%d] before Call RPC, args = %d", rf.me, args)
+					reply := AppendEntryReply{}
+					ok := rf.peers[i].Call("Raft.AppendEntries", &args, &reply)
+					for !ok {
+						// DPrintf("[%d] sendEntries to [%d] failed through RPC, retry...", leaderId, i)
+						if rf.killed() {
+							return
 						}
-						// select {
-						// case waitAppendChan <- true:
-						// 	// DPrintf("check here: push to waitAppendChan")
-						// 	break
-						// default:
-						// 	break
-						// }
+						ok = rf.peers[i].Call("Raft.AppendEntries", &args, &reply)
+						time.Sleep(10 * time.Millisecond)
 					}
-					appendCountMtx.Unlock()
-					break
+					if reply.Term > term {
+						DPrintf("[%d] can't sendEntry to [%d], term out of date", rf.me, i)
+						rf.mu.Lock()
+						if reply.Term > rf.currentTerm {
+							rf.currentState = FOLLOWER
+							rf.currentTerm = reply.Term
+							rf.votefor = -1
+							DPrintf("[%d] in sendEntries(): is not the latest term, term(%d -> %d), turn to follower", rf.me, term, reply.Term)
+						}
+						rf.mu.Unlock()
+						break
+					} else if !reply.Success {
+						DPrintf("[%d] send entries to [%d] failed", rf.me, i)
+						rf.nextIndex[i]--
+						args.PrevLogIndex--
+						args.PrevLogTerm = rf.log[args.PrevLogIndex-1].Term
+						args.Entries = append([]Entry{rf.log[args.PrevLogIndex]}, args.Entries...)
+					} else { // append success
+						appendCountMtx.Lock()
+						appendCount++
+						if appendCount > len(rf.peers)/2 {
+							rf.mu.Lock()
+							rf.commitIndex = prevLogIndex + 1
+							// apply to state machine
+							for rf.commitIndex > rf.lastApplied {
+								// DPrintf("[%d] apply to state machine, lastApplied = %d, commitIndex = %d", rf.me, rf.lastApplied, rf.commitIndex)
+								// DPrintf("DEBUG: [%d] len of log = %d, lastApplied = %d", rf.me, len(rf.log), rf.lastApplied)
+								apply := ApplyMsg{
+									CommandValid: true,
+									Command:      rf.log[rf.lastApplied].Command,
+									CommandIndex: rf.lastApplied + 1,
+								}
+								rf.applyCh <- apply
+								DPrintf("[%d] Apply commitIndex: %d, lastApplied: %d, command: %d", rf.me, rf.commitIndex, rf.lastApplied, rf.log[rf.lastApplied].Command)
+								rf.lastApplied++
+							}
+							rf.mu.Unlock()
+						}
+						appendCountMtx.Unlock()
+						break
+					}
 				}
-			}
-		}(i)
+			}(i)
+		}
 	}
 }
 
@@ -691,12 +734,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index = rf.nextIndex[rf.me]
 	rf.nextIndex[rf.me]++
 	rf.log = append(rf.log, entry)
+	DPrintf("[%d] Start(): log = %d", rf.me, rf.log)
 	rf.mu.Unlock()
-	entries := make([]Entry, 1)
-	entries[0] = entry
-	waitAppendChan := make(chan bool)
-	go rf.sendEntries(entries, waitAppendChan)
-	DPrintf("Start(): index = %d, command = %d", index, command)
+	rf.entryChan <- index
+	// DPrintf("Start(): index = %d, command = %d", index, command)
 	// <-waitAppendChan // wait for append success
 	DPrintf("Start() return: index = %d, term = %d", index, term)
 	return index, term, isLeader
@@ -750,17 +791,21 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	DPrintf("electionTimeout = %d, heartbeatTimeout = %d", rf.electionTimeout, rf.heartbeatTimeout)
 	rf.electionChan = make(chan bool, 1)
 	rf.heartbeatChan = make(chan bool, 1)
+	rf.heartbeatTerm = 0
 	// 2B paramenter init
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))
 	rf.lastApplied = 0
 	rf.applyCh = applyCh
+	rf.entryChan = make(chan int)
 	// Your initialization code here (2A, 2B, 2C).
 	rand.Seed(time.Now().UnixNano())
 
 	go rf.electionTimer()
 
 	go rf.ticker()
+
+	go rf.sendEntries()
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
