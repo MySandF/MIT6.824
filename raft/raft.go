@@ -235,7 +235,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		}
 		DPrintf("[%d] Votefor = %d", rf.me, rf.votefor)
 		rf.mu.Unlock()
-		rf.resetElectionTimer()
+		if reply.VoteGranted == true {
+			rf.resetElectionTimer()
+		}
 	}
 }
 
@@ -284,7 +286,9 @@ func (rf *Raft) startElection() {
 				// this server win the election
 				if vote_count > len(rf.peers)/2 && rf.currentState != LEADER {
 					rf.currentState = LEADER
-					go rf.sendHeartBeat(term)
+					if len(rf.log) == 0 {
+						go rf.sendHeartBeat(term)
+					}
 					rf.heartbeatTerm = term
 					DPrintf("[%d] become leader", me)
 					rf.resetHeartbeatTimer()
@@ -370,9 +374,18 @@ func (rf *Raft) AppendEntries(args *AppendEntryArgs, reply *AppendEntryReply) {
 		// (2) if an existing entry conflicts with a new one(same index but
 		// different terms), delete the existing entry and all that following it
 		DPrintf("Append process: [%d]'s lastIndex: %d, [%d]'s prevLogIndex: %d,log = %d, entry = %d", rf.me, lastIndex, args.LeaderId, args.PrevLogIndex, rf.log, args.Entries)
+		// follower条目比leader少
 		if lastIndex < args.PrevLogIndex {
 			DPrintf("[%d]'s index < [%d]'s PrevLogIndex", rf.me, args.LeaderId)
 			reply.Success = false
+			return
+		} else if lastIndex != 0 && lastIndex == args.PrevLogIndex && rf.log[lastIndex-1].Term != args.PrevLogTerm {
+			DPrintf("[%d]'s last Index == [%d]'s PrevLogIndex but different Term", rf.me, args.LeaderId)
+			reply.Success = false
+			return
+		} else if lastIndex == args.PrevLogIndex+1 && rf.log[lastIndex-1].Term == args.Term {
+			DPrintf("[%d] command was appended", rf.me)
+			reply.Success = true
 			return
 		}
 		shouldAppend := true
@@ -383,6 +396,11 @@ func (rf *Raft) AppendEntries(args *AppendEntryArgs, reply *AppendEntryReply) {
 				rf.log = rf.log[:args.PrevLogIndex-1]
 				len2 := len(rf.log)
 				DPrintf("[%d]'s term != [%d]'s Term, delete following entries, len: %d -> %d", rf.me, args.LeaderId, len1, len2)
+			}
+			if len(rf.log) < args.PrevLogIndex {
+				DPrintf("[%d]'s index < [%d]'s PrevLogIndex after delete", rf.me, args.LeaderId)
+				reply.Success = false
+				return
 			}
 		}
 		if len(rf.log) > args.PrevLogIndex && rf.log[args.PrevLogIndex].Term == args.Term {
@@ -397,26 +415,36 @@ func (rf *Raft) AppendEntries(args *AppendEntryArgs, reply *AppendEntryReply) {
 			DPrintf("[%d] append entry from [%d], len of log: %d -> %d, entry: %d", rf.me, args.LeaderId, applen1, applen2, rf.log)
 		}
 	}
+	// 当前term的entry提交后，前面的entry才能提交
 	if args.LeaderCommit > rf.commitIndex {
-		DPrintf("[%d] update commit,  commitIndex = %d, leaderCommit = %d", rf.me, rf.commitIndex, args.LeaderCommit)
-		lastNewEntry := lastIndex + len(args.Entries)
-		if args.LeaderCommit < lastNewEntry {
-			rf.commitIndex = args.LeaderCommit
-		} else {
-			rf.commitIndex = lastNewEntry
-		}
-		// apply to state machine
-		for rf.commitIndex > rf.lastApplied {
-			DPrintf("[%d] apply to state machine, lastApplied = %d, commitIndex = %d", rf.me, rf.lastApplied, rf.commitIndex)
-
-			apply := ApplyMsg{
-				CommandValid: true,
-				Command:      rf.log[rf.lastApplied].Command,
-				CommandIndex: rf.lastApplied + 1,
+		shouldCommit := false
+		// find a log which's term is currentTerm and is committed by leader
+		for i := rf.commitIndex + 1; i <= args.LeaderCommit && i <= len(rf.log); i++ {
+			if rf.log[i-1].Term == rf.currentTerm {
+				shouldCommit = true
 			}
-			rf.applyCh <- apply
-			rf.lastApplied++
-			DPrintf("[%d] Apply commitIndex: %d, lastApplied: %d, command: %d", rf.me, rf.commitIndex, rf.lastApplied, rf.log[rf.lastApplied-1].Command)
+		}
+		if shouldCommit {
+			DPrintf("[%d] update commit,  commitIndex = %d, leaderCommit = %d", rf.me, rf.commitIndex, args.LeaderCommit)
+			lastNewEntry := lastIndex + len(args.Entries) // Index of the last entry
+			if args.LeaderCommit < lastNewEntry {
+				rf.commitIndex = args.LeaderCommit
+			} else {
+				rf.commitIndex = lastNewEntry
+			}
+			// apply to state machine
+			for rf.commitIndex > rf.lastApplied {
+				DPrintf("[%d] apply to state machine, lastApplied = %d, commitIndex = %d", rf.me, rf.lastApplied, rf.commitIndex)
+
+				apply := ApplyMsg{
+					CommandValid: true,
+					Command:      rf.log[rf.lastApplied].Command,
+					CommandIndex: rf.lastApplied + 1,
+				}
+				rf.applyCh <- apply
+				rf.lastApplied++
+				DPrintf("[%d] Apply commitIndex: %d, lastApplied: %d, command: %d", rf.me, rf.commitIndex, rf.lastApplied, rf.log[rf.lastApplied-1].Command)
+			}
 		}
 	}
 }
@@ -518,7 +546,7 @@ func (rf *Raft) sendEntries() {
 					LeaderCommit: leaderCommit,
 				}
 				for {
-					DPrintf("[%d] before Call RPC, args = %d", rf.me, args)
+					DPrintf("[%d] before Call RPC to [%d], args = %d", rf.me, i, args)
 					reply := AppendEntryReply{}
 					ok := rf.peers[i].Call("Raft.AppendEntries", &args, &reply)
 					for !ok {
@@ -544,7 +572,11 @@ func (rf *Raft) sendEntries() {
 						DPrintf("[%d] send entries to [%d] failed", rf.me, i)
 						rf.nextIndex[i]--
 						args.PrevLogIndex--
-						args.PrevLogTerm = rf.log[args.PrevLogIndex-1].Term
+						if args.PrevLogIndex == 0 {
+							args.PrevLogTerm = 0
+						} else {
+							args.PrevLogTerm = rf.log[args.PrevLogIndex-1].Term
+						}
 						args.Entries = append([]Entry{rf.log[args.PrevLogIndex]}, args.Entries...)
 					} else { // append success
 						appendCountMtx.Lock()
