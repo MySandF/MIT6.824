@@ -20,10 +20,13 @@ package raft
 import (
 	// "crypto/rand"
 
+	"bytes"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"../labgob"
 
 	"../labrpc"
 )
@@ -128,6 +131,13 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votefor)
+	e.Encode(rf.log)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 //
@@ -150,6 +160,20 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+	buf := bytes.NewBuffer(data)
+	decoder := labgob.NewDecoder(buf)
+	var current_term, vote_for int
+	var log []Entry
+	if decoder.Decode(&current_term) != nil ||
+		decoder.Decode(&vote_for) != nil ||
+		decoder.Decode(&log) != nil {
+		DPrintf("[%d] readPersist(): decode error", rf.me)
+	} else {
+		DPrintf("[%d] decode result: currentTerm = %d, votefor = %d, log = %d", rf.me, current_term, vote_for, log)
+		rf.currentTerm = current_term
+		rf.votefor = vote_for
+		rf.log = log
+	}
 }
 
 //
@@ -185,6 +209,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	term := rf.currentTerm
 	state := rf.currentState
+	oldvote := rf.votefor
 	rf.mu.Unlock()
 	DPrintf("[%d] requestVote to [%d](%d)", args.CandidateId, rf.me, state)
 	if term > args.Term { // 当前server任期大, 拒绝投票
@@ -238,6 +263,12 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		if reply.VoteGranted == true {
 			rf.resetElectionTimer()
 		}
+		// update persist state
+		rf.mu.Lock()
+		if oldvote != rf.votefor || term != rf.currentTerm {
+			rf.persist()
+		}
+		rf.mu.Unlock()
 	}
 }
 
@@ -247,8 +278,9 @@ func (rf *Raft) startElection() {
 	}
 	rf.mu.Lock()
 	rf.currentTerm++
-	rf.currentState = CANDIDATER
 	rf.votefor = rf.me
+	rf.persist()
+	rf.currentState = CANDIDATER
 	term := rf.currentTerm
 	me := rf.me
 	vote_count := 1
@@ -306,6 +338,7 @@ func (rf *Raft) startElection() {
 				DPrintf("[%d] in startElection(): turn to follower", rf.me)
 				rf.currentTerm = reply.Term
 				rf.votefor = -1
+				rf.persist()
 				rf.mu.Unlock()
 			}
 			if !reply.VoteGranted {
@@ -325,8 +358,11 @@ type AppendEntryArgs struct {
 }
 
 type AppendEntryReply struct {
-	Term    int
-	Success bool
+	Term         int
+	ConflictTerm int
+	FirstIndex   int
+	LastIndex    int
+	Success      bool
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntryArgs, reply *AppendEntryReply) {
@@ -357,6 +393,7 @@ func (rf *Raft) AppendEntries(args *AppendEntryArgs, reply *AppendEntryReply) {
 	if term < args.Term {
 		rf.votefor = args.LeaderId
 		rf.currentTerm = args.Term
+		rf.persist()
 	}
 	if state != FOLLOWER {
 		rf.currentState = FOLLOWER
@@ -377,10 +414,29 @@ func (rf *Raft) AppendEntries(args *AppendEntryArgs, reply *AppendEntryReply) {
 		// follower条目比leader少
 		if lastIndex < args.PrevLogIndex {
 			DPrintf("[%d]'s index < [%d]'s PrevLogIndex", rf.me, args.LeaderId)
+			if lastIndex == 0 {
+				reply.ConflictTerm = 0
+				reply.LastIndex = 0
+				reply.FirstIndex = 0
+			} else {
+				reply.ConflictTerm = rf.log[lastIndex-1].Term
+				first := lastIndex
+				for ; first >= 1 && rf.log[first-1].Term == reply.ConflictTerm; first-- {
+				}
+				reply.LastIndex = lastIndex
+				reply.FirstIndex = first + 1
+			}
 			reply.Success = false
 			return
+			// log数量相同但Term不同
 		} else if lastIndex != 0 && lastIndex == args.PrevLogIndex && rf.log[lastIndex-1].Term != args.PrevLogTerm {
 			DPrintf("[%d]'s last Index == [%d]'s PrevLogIndex but different Term", rf.me, args.LeaderId)
+			reply.ConflictTerm = rf.log[lastIndex-1].Term
+			first := lastIndex
+			for ; first >= 1 && rf.log[first-1].Term == reply.ConflictTerm; first-- {
+			}
+			reply.LastIndex = lastIndex
+			reply.FirstIndex = first + 1
 			reply.Success = false
 			return
 		} else if lastIndex == args.PrevLogIndex+1 && rf.log[lastIndex-1].Term == args.Term {
@@ -389,16 +445,30 @@ func (rf *Raft) AppendEntries(args *AppendEntryArgs, reply *AppendEntryReply) {
 			return
 		}
 		shouldAppend := true
-		if lastIndex > args.PrevLogIndex {
+		if lastIndex > args.PrevLogIndex && args.PrevLogIndex > 0 {
 			matchTerm := rf.log[args.PrevLogIndex].Term
 			if matchTerm != args.Term {
 				len1 := len(rf.log)
 				rf.log = rf.log[:args.PrevLogIndex-1]
+				rf.persist()
 				len2 := len(rf.log)
 				DPrintf("[%d]'s term != [%d]'s Term, delete following entries, len: %d -> %d", rf.me, args.LeaderId, len1, len2)
 			}
+			// 删除后log数量不匹配
 			if len(rf.log) < args.PrevLogIndex {
 				DPrintf("[%d]'s index < [%d]'s PrevLogIndex after delete", rf.me, args.LeaderId)
+				if len(rf.log) == 0 {
+					reply.ConflictTerm = 0
+					reply.FirstIndex = 0
+					reply.LastIndex = 0
+				} else {
+					reply.ConflictTerm = rf.log[len(rf.log)-1].Term
+					first := len(rf.log)
+					for ; first >= 1 && rf.log[first-1].Term == reply.ConflictTerm; first-- {
+					}
+					reply.FirstIndex = first + 1
+					reply.LastIndex = len(rf.log)
+				}
 				reply.Success = false
 				return
 			}
@@ -411,6 +481,7 @@ func (rf *Raft) AppendEntries(args *AppendEntryArgs, reply *AppendEntryReply) {
 		if shouldAppend {
 			applen1 := len(rf.log)
 			rf.log = append(rf.log, args.Entries...)
+			rf.persist()
 			applen2 := len(rf.log)
 			DPrintf("[%d] append entry from [%d], len of log: %d -> %d, entry: %d", rf.me, args.LeaderId, applen1, applen2, rf.log)
 		}
@@ -433,7 +504,7 @@ func (rf *Raft) AppendEntries(args *AppendEntryArgs, reply *AppendEntryReply) {
 				rf.commitIndex = lastNewEntry
 			}
 			// apply to state machine
-			for rf.commitIndex > rf.lastApplied {
+			for rf.commitIndex > rf.lastApplied && rf.lastApplied < len(rf.log) {
 				DPrintf("[%d] apply to state machine, lastApplied = %d, commitIndex = %d", rf.me, rf.lastApplied, rf.commitIndex)
 
 				apply := ApplyMsg{
@@ -494,6 +565,7 @@ func (rf *Raft) sendHeartBeat(term int) {
 				rf.currentState = FOLLOWER
 				rf.currentTerm = reply.Term
 				rf.votefor = -1
+				rf.persist()
 				DPrintf("[%d] in sendHeartBeat(): is not the latest term, term(%d -> %d), turn to follower", rf.me, term, reply.Term)
 			}
 			rf.mu.Unlock()
@@ -564,20 +636,58 @@ func (rf *Raft) sendEntries() {
 							rf.currentState = FOLLOWER
 							rf.currentTerm = reply.Term
 							rf.votefor = -1
+							rf.persist()
 							DPrintf("[%d] in sendEntries(): is not the latest term, term(%d -> %d), turn to follower", rf.me, term, reply.Term)
 						}
 						rf.mu.Unlock()
 						break
 					} else if !reply.Success {
-						DPrintf("[%d] send entries to [%d] failed", rf.me, i)
-						rf.nextIndex[i]--
-						args.PrevLogIndex--
-						if args.PrevLogIndex == 0 {
+						DPrintf("[%d] send entries to [%d] failed, reply's CT: %d, FI: %d, LI: %d", rf.me, i, reply.ConflictTerm, reply.FirstIndex, reply.LastIndex)
+						if reply.ConflictTerm == 0 {
+							args.PrevLogIndex = 0
 							args.PrevLogTerm = 0
+							// args.Entries = rf.log[0:sendIndex]
 						} else {
-							args.PrevLogTerm = rf.log[args.PrevLogIndex-1].Term
+							hasTerm := false
+							idx := len(rf.log)
+							for ; idx >= 1; idx-- {
+								if rf.log[idx-1].Term == reply.ConflictTerm {
+									hasTerm = true
+									break
+								}
+							}
+							// DPrintf("[%d] idx = %d", rf.me, idx)
+							if hasTerm {
+								args.PrevLogTerm = reply.ConflictTerm
+								if reply.LastIndex == idx {
+									args.PrevLogIndex = reply.LastIndex
+									// args.Entries = rf.log[args.PrevLogIndex:sendIndex]
+								} else if reply.LastIndex > idx {
+									args.PrevLogIndex = idx
+									// args.Entries = rf.log[args.PrevLogIndex:sendIndex]
+								} else {
+									args.PrevLogIndex = reply.LastIndex
+									// args.Entries = rf.log[args.PrevLogIndex:sendIndex]
+								}
+							} else {
+								args.PrevLogIndex = reply.FirstIndex - 1
+								if args.PrevLogIndex == 0 {
+									args.PrevLogTerm = 0
+								} else {
+									args.PrevLogTerm = rf.log[args.PrevLogIndex-1].Term
+								}
+							}
 						}
-						args.Entries = append([]Entry{rf.log[args.PrevLogIndex]}, args.Entries...)
+						DPrintf("[%d] in sendEntry: args.PrevLogIndex = %d", rf.me, args.PrevLogIndex)
+						args.Entries = rf.log[args.PrevLogIndex:sendIndex]
+						// rf.nextIndex[i] = reply.FirstIndex
+						// args.PrevLogIndex = reply.FirstIndex - 1
+						// if args.PrevLogIndex == 0 {
+						// 	args.PrevLogTerm = 0
+						// } else {
+						// 	args.PrevLogTerm = rf.log[args.PrevLogIndex-1].Term
+						// }
+						// args.Entries = rf.log[reply.FirstIndex:sendIndex]
 					} else { // append success
 						appendCountMtx.Lock()
 						appendCount++
@@ -766,6 +876,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index = rf.nextIndex[rf.me]
 	rf.nextIndex[rf.me]++
 	rf.log = append(rf.log, entry)
+	rf.persist()
 	DPrintf("[%d] Start(): log = %d", rf.me, rf.log)
 	rf.mu.Unlock()
 	rf.entryChan <- index
